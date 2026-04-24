@@ -1,12 +1,3 @@
-"""
-Преобразование стиля: ruT5 + RuBERT classifier.
-  - Обучение классификатора стиля (RuBERT)
-  - Обучение генератора (ruT5-base)
-  - Сравнение 4 конфигураций: с/без префикса x style_transfer/eval_loss
-  - Устойчивость по 3 random seed
-  - Бейзлайн (копирование входа)
-  - Анализ ошибок
-"""
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -42,10 +33,6 @@ from src.metrics import (
 
 device = get_device()
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Classifier
-# ═══════════════════════════════════════════════════════════════════════════
 
 def train_or_load_classifier(df, train_ids, val_ids):
     clf_dir = "style_clf_rubert/best"
@@ -90,10 +77,6 @@ def train_or_load_classifier(df, train_ids, val_ids):
     return tok, mdl
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Train one generator config
-# ═══════════════════════════════════════════════════════════════════════════
-
 def train_one_config(train_ds, val_ds, val_df, clf_tok, clf_model,
                      prefix, best_metric, greater, out_dir, seed=GEN_SEED):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
@@ -136,10 +119,6 @@ def train_one_config(train_ds, val_ds, val_df, clf_tok, clf_model,
     return gen_dir, gen_tok
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 4 configs comparison
-# ═══════════════════════════════════════════════════════════════════════════
-
 def compare_4_configs(train_ds, val_ds, val_df, test_df, clf_tok, clf_model):
     CONFIGS = [
         {"name": "Prefix + style_transfer",    "prefix": PREFIX, "metric": "style_content_lang_score", "greater": True},
@@ -151,7 +130,7 @@ def compare_4_configs(train_ds, val_ds, val_df, test_df, clf_tok, clf_model):
     results = []
 
     for cfg in CONFIGS:
-        print(f"\n{'='*60}\n{cfg['name']}\n{'='*60}")
+        print(f"\n{cfg['name']}")
         safe = cfg["name"].replace(" ", "_").replace("+", "")
         gen_dir, gen_tok = train_one_config(
             train_ds, val_ds, val_df, clf_tok, clf_model,
@@ -164,7 +143,7 @@ def compare_4_configs(train_ds, val_ds, val_df, test_df, clf_tok, clf_model):
         results.append(res)
         del gen_mdl; torch.cuda.empty_cache()
 
-    print("\n=== 4 Configs Summary ===")
+    print("\n4 Configs Summary")
     df = pd.DataFrame(results)
     print(f"{'Config':<40} {'CosSim':>8} {'Accuracy':>10} {'BLEU':>8}")
     for _, r in df.iterrows():
@@ -172,16 +151,12 @@ def compare_4_configs(train_ds, val_ds, val_df, test_df, clf_tok, clf_model):
     return results
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Multi-seed stability
-# ═══════════════════════════════════════════════════════════════════════════
-
 def multi_seed_runs(pairs, clf_tok, clf_model):
-    SEEDS = [24, 42, 7]
+    SEEDS = [random.randint(0, 2**31 - 1) for _ in range(3)]
     results = []
 
     for seed_i in SEEDS:
-        print(f"\n{'='*60}\nSEED = {seed_i}\n{'='*60}")
+        print(f"\nSEED = {seed_i}")
         random.seed(seed_i); np.random.seed(seed_i)
         torch.manual_seed(seed_i); torch.cuda.manual_seed_all(seed_i)
 
@@ -208,17 +183,13 @@ def multi_seed_runs(pairs, clf_tok, clf_model):
         results.append(res)
         del gen_mdl; torch.cuda.empty_cache()
 
-    print("\n=== Multi-seed Summary ===")
+    print("\nMulti-seed Summary")
     df = pd.DataFrame(results)
     for col in ["Style accuracy", "SBERT tgt-pred mean", "BLEU"]:
         vals = df[col]
         print(f"  {col}: {vals.mean():.4f} +- {vals.std():.4f}")
     return results
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════════════════
 
 def main():
     random.seed(GEN_SEED); np.random.seed(GEN_SEED)
@@ -239,11 +210,9 @@ def main():
     train_ds = HFDataset.from_pandas(train_df[["source", "target"]], preserve_index=False)
     val_ds = HFDataset.from_pandas(val_df[["source", "target"]], preserve_index=False)
 
-    # Classifier
     clf_tok, clf_model = train_or_load_classifier(df, train_ids, val_ids)
 
-    # Main generator
-    print("\n" + "=" * 70 + "\nMAIN GENERATOR (prefix + style_transfer)\n" + "=" * 70)
+    print("\nMAIN GENERATOR (prefix + style_transfer)")
     gen_dir, gen_tok = train_one_config(
         train_ds, val_ds, val_df, clf_tok, clf_model,
         PREFIX, "style_content_lang_score", True, "style_transfer_rut5")
@@ -254,26 +223,21 @@ def main():
 
     res_main = evaluate_generation(src_texts, tgt_texts, pred_texts, clf_tok, clf_model, label="ruT5 main")
 
-    # Baseline: copy
     res_bl = evaluate_generation(src_texts, tgt_texts, src_texts, clf_tok, clf_model, label="BASELINE (copy)")
 
-    print("\n=== Model vs Baseline ===")
+    print("\nModel vs Baseline")
     print(f"{'Metric':<30} {'Baseline':>12} {'Model':>12} {'Delta':>12}")
     for k in ["Style accuracy", "Mean p(scientific) pred", "SBERT tgt-pred mean", "BLEU"]:
         print(f"{k:<30} {res_bl[k]:>12.4f} {res_main[k]:>12.4f} {res_main[k]-res_bl[k]:>+12.4f}")
 
     del gen_mdl; torch.cuda.empty_cache()
 
-    # 4 configs
-    print("\n" + "=" * 70 + "\n4 CONFIGURATIONS COMPARISON\n" + "=" * 70)
+    print("\n4 CONFIGURATIONS COMPARISON")
     config_results = compare_4_configs(train_ds, val_ds, val_df, test_df, clf_tok, clf_model)
-
-    # Multi-seed
-    print("\n" + "=" * 70 + "\nMULTI-SEED STABILITY\n" + "=" * 70)
+    print("\nMULTI-SEED STABILITY")
     seed_results = multi_seed_runs(pairs, clf_tok, clf_model)
 
-    # Final summary
-    print("\n" + "=" * 70 + "\nFINAL SUMMARY\n" + "=" * 70)
+    print("\nFINAL SUMMARY")
     print(f"Corpus: 500 pairs")
     print(f"Split: train={len(train_df)}, val={len(val_df)}, test={len(test_df)}")
     print(f"Generator: ruT5-base")

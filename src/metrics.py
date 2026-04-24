@@ -15,8 +15,6 @@ def _count_words(text: str) -> int:
     return max(1, len(_word_re.findall(text)))
 
 
-# ── Classification ──
-
 def clf_report(y_true, y_pred):
     return classification_report(y_true, y_pred, digits=3)
 
@@ -30,8 +28,6 @@ def clf_metrics(y_true, y_pred):
 def conf_matrix(y_true, y_pred):
     return confusion_matrix(y_true, y_pred)
 
-
-# ── SBERT ──
 
 _sbert_model = None
 
@@ -51,8 +47,6 @@ def sbert_encode(texts, batch_size=32):
     )
 
 
-# ── Style classifier proxy ──
-
 @torch.no_grad()
 def p_scientific_batch(texts, clf_tokenizer, clf_model, batch_size=32, max_len=256):
     device = get_device()
@@ -69,8 +63,6 @@ def p_scientific_batch(texts, clf_tokenizer, clf_model, batch_size=32, max_len=2
         probs.append(p1)
     return np.concatenate(probs)
 
-
-# ── Language quality ──
 
 _lt_tool = None
 
@@ -96,8 +88,6 @@ def count_language_errors(texts):
         errs100.append(100.0 * n / w)
     return np.array(errs, dtype=float), np.array(errs100, dtype=float)
 
-
-# ── Generation evaluation ──
 
 def evaluate_generation(src_texts, tgt_texts, pred_texts,
                         clf_tokenizer, clf_model, label="MODEL"):
@@ -133,8 +123,6 @@ def evaluate_generation(src_texts, tgt_texts, pred_texts,
         "Lang errors/100 words mean": float(err_100.mean()),
     }
 
-
-# ── Composite metric for Seq2SeqTrainer ──
 
 def make_gen_compute_metrics(gen_tokenizer, clf_tokenizer, clf_model,
                              val_src_emb, val_tgt_emb):

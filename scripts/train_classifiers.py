@@ -1,18 +1,10 @@
-"""
-Обучение и оценка классификаторов:
-  1. Baseline (LogReg + ручные признаки) — GridSearch + абляции + коэффициенты
-  2. SVM (char TF-IDF)                   — GridSearch по n-граммам, min_df, C
-  3. Char-CNN-BiLSTM                     — подбор гиперпараметров
-  4. RuBERT                              — подбор гиперпараметров
-
-Для каждой модели: GroupKFold CV по фолдам, оценка на тесте, SHAP.
-"""
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import warnings
 warnings.filterwarnings("ignore")
 
+import random
 import numpy as np
 import pandas as pd
 import torch
@@ -54,10 +46,6 @@ set_seed()
 device = get_device()
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 1. BASELINE
-# ═══════════════════════════════════════════════════════════════════════════
-
 def baseline_grid_search(data):
     X = extract_all(data["text_clean"])
     y = data["label"].values
@@ -75,7 +63,7 @@ def baseline_grid_search(data):
     gs = GridSearchCV(pipe, param_grid, cv=gkf, scoring="f1_macro", refit=True, n_jobs=-1)
     gs.fit(X, y, groups=groups)
 
-    print("=== Baseline GridSearch ===")
+    print("Baseline GridSearch")
     res = pd.DataFrame(gs.cv_results_)
     for _, row in res.iterrows():
         print(f"  C={row['param_lr__C']}, cw={row['param_lr__class_weight']}, "
@@ -107,7 +95,7 @@ def baseline_ablation(data):
                         "f1": f1_score(y[te], p, average="macro")})
         return pd.DataFrame(ms).mean()
 
-    print("\n=== Ablation ===")
+    print("\nAblation")
     for label, mode in [("Full", "full"), ("No pronouns", "no_pron"),
                          ("No punctuation", "no_punct"), ("Trunc 200", "trunc200")]:
         r = _run(mode)
@@ -119,7 +107,7 @@ def baseline_coefficients(pipe, X, y):
     coefs = pipe.named_steps["lr"].coef_[0]
     ct = pd.DataFrame({"feat": FEAT_NAMES, "coef": coefs})
     ct = ct.reindex(ct["coef"].abs().sort_values(ascending=False).index)
-    print("\n=== Coefficients ===")
+    print("\nCoefficients")
     for _, row in ct.iterrows():
         print(f"  {row['feat']:<20} {row['coef']:+.6f}")
 
@@ -142,7 +130,7 @@ def run_baseline(data, train_df, test_df):
         p, r, f1, _ = precision_recall_fscore_support(y[te], pred, average="macro")
         folds.append({"fold": fold, "acc": acc, "prec": p, "rec": r, "f1": f1})
     cv = pd.DataFrame(folds)
-    print("\n=== Baseline CV ===")
+    print("\nBaseline CV")
     print(cv[["fold", "acc", "f1"]].to_string(index=False))
     print(f"Mean: Acc={cv['acc'].mean():.3f}+-{cv['acc'].std():.3f}, F1={cv['f1'].mean():.3f}+-{cv['f1'].std():.3f}")
 
@@ -152,10 +140,6 @@ def run_baseline(data, train_df, test_df):
     print("\n" + classification_report(test_df["label"].values, y_pred, digits=3))
     return y_pred, cv
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 2. SVM
-# ═══════════════════════════════════════════════════════════════════════════
 
 def svm_grid_search(data):
     pipe = Pipeline([
@@ -171,7 +155,7 @@ def svm_grid_search(data):
     gs = GridSearchCV(pipe, param_grid, cv=gkf, scoring="f1_macro", refit=True, n_jobs=-1)
     gs.fit(data["text_clean"], data["label"], groups=data["pair_id"])
 
-    print("=== SVM GridSearch ===")
+    print("SVM GridSearch")
     res = pd.DataFrame(gs.cv_results_).sort_values("rank_test_score")
     for _, row in res.head(10).iterrows():
         print(f"  ngram={row['param_tfidf__ngram_range']}, min_df={row['param_tfidf__min_df']}, "
@@ -193,10 +177,10 @@ def svm_shap_analysis(pipe, train_df, test_df):
 
     top_sci = np.argsort(mean_shap)[-10:][::-1]
     top_pop = np.argsort(mean_shap)[:10]
-    print("\n=== SHAP SVM: scientific ===")
+    print("\nSHAP SVM: scientific")
     for i in top_sci:
         print(f"  {feat_names[i]:<20} SHAP={mean_shap[i]:+.4f}")
-    print("=== SHAP SVM: popular ===")
+    print("SHAP SVM: popular")
     for i in top_pop:
         print(f"  {feat_names[i]:<20} SHAP={mean_shap[i]:+.4f}")
 
@@ -213,7 +197,7 @@ def run_svm(data, train_df, test_df):
         p, r, f1, _ = precision_recall_fscore_support(data.iloc[te]["label"], preds, average="macro")
         folds.append({"fold": fold, "acc": acc, "prec": p, "rec": r, "f1": f1})
     cv = pd.DataFrame(folds)
-    print("\n=== SVM CV ===")
+    print("\nSVM CV")
     print(cv[["fold", "acc", "f1"]].to_string(index=False))
     print(f"Mean: F1={cv['f1'].mean():.4f}+-{cv['f1'].std():.4f}")
 
@@ -225,11 +209,8 @@ def run_svm(data, train_df, test_df):
     return y_pred, cv
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 3. Char-CNN-BiLSTM
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _bilstm_one_fold(fold_tr, fold_val, emb, hid, drop, lr, max_clen=MAX_CHAR_LEN):
+def _bilstm_one_fold(fold_tr, fold_val, emb, hid, drop, lr,
+                     epochs=EPOCHS_BI, max_clen=MAX_CHAR_LEN):
     vocab = build_char_vocab(fold_tr["text"].tolist())
     tr_dl = DataLoader(CharDataset(fold_tr, vocab, max_clen), batch_size=BATCH_SIZE, shuffle=True)
     va_dl = DataLoader(CharDataset(fold_val, vocab, max_clen), batch_size=BATCH_SIZE)
@@ -240,7 +221,7 @@ def _bilstm_one_fold(fold_tr, fold_val, emb, hid, drop, lr, max_clen=MAX_CHAR_LE
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max", factor=0.5, patience=2)
 
     best_f1, pat = 0, 0
-    for ep in range(1, EPOCHS_BI + 1):
+    for ep in range(1, epochs + 1):
         model.train()
         for b in tr_dl:
             opt.zero_grad()
@@ -268,13 +249,15 @@ def _bilstm_one_fold(fold_tr, fold_val, emb, hid, drop, lr, max_clen=MAX_CHAR_LE
 
 def bilstm_hyperparam_search(train_df):
     configs = [
-        {"emb": 32,  "hid": 128, "drop": 0.3, "lr": 3e-4},
-        {"emb": 64,  "hid": 256, "drop": 0.3, "lr": 3e-4},
-        {"emb": 64,  "hid": 256, "drop": 0.2, "lr": 1e-4},
-        {"emb": 64,  "hid": 256, "drop": 0.5, "lr": 5e-4},
-        {"emb": 128, "hid": 512, "drop": 0.3, "lr": 3e-4},
+        {"emb": 32,  "hid": 128, "drop": 0.3, "lr": 3e-4, "epochs": 15},
+        {"emb": 64,  "hid": 256, "drop": 0.3, "lr": 3e-4, "epochs": 15},
+        {"emb": 64,  "hid": 256, "drop": 0.3, "lr": 3e-4, "epochs": 20},
+        {"emb": 64,  "hid": 256, "drop": 0.3, "lr": 3e-4, "epochs": 25},
+        {"emb": 64,  "hid": 256, "drop": 0.2, "lr": 1e-4, "epochs": 20},
+        {"emb": 64,  "hid": 256, "drop": 0.5, "lr": 5e-4, "epochs": 15},
+        {"emb": 128, "hid": 512, "drop": 0.3, "lr": 3e-4, "epochs": 20},
     ]
-    print("=== BiLSTM Hyperparam Search ===")
+    print("BiLSTM Hyperparam Search")
     best_f1, best_cfg = 0, configs[1]
     gkf = GroupKFold(n_splits=5)
     for cfg in configs:
@@ -282,10 +265,12 @@ def bilstm_hyperparam_search(train_df):
         for fold, (tr_i, val_i) in enumerate(gkf.split(np.zeros(len(train_df)), train_df["label"], groups=train_df["pair_id"]), 1):
             res = _bilstm_one_fold(train_df.iloc[tr_i].reset_index(drop=True),
                                     train_df.iloc[val_i].reset_index(drop=True),
-                                    cfg["emb"], cfg["hid"], cfg["drop"], cfg["lr"])
+                                    cfg["emb"], cfg["hid"], cfg["drop"], cfg["lr"],
+                                    epochs=cfg["epochs"])
             fold_f1s.append(res["f1"])
         mf = np.mean(fold_f1s)
-        print(f"  emb={cfg['emb']}, hid={cfg['hid']}, drop={cfg['drop']}, lr={cfg['lr']}: F1={mf:.4f}+-{np.std(fold_f1s):.4f}")
+        print(f"  emb={cfg['emb']}, hid={cfg['hid']}, drop={cfg['drop']}, "
+              f"lr={cfg['lr']}, ep={cfg['epochs']}: F1={mf:.4f}+-{np.std(fold_f1s):.4f}")
         if mf > best_f1: best_f1, best_cfg = mf, cfg
     print(f"Best: {best_cfg}, F1={best_f1:.4f}")
     return best_cfg
@@ -299,13 +284,13 @@ def run_bilstm(data, train_df, test_df):
     for fold, (tr_i, val_i) in enumerate(gkf.split(np.zeros(len(train_df)), train_df["label"], groups=train_df["pair_id"]), 1):
         res = _bilstm_one_fold(train_df.iloc[tr_i].reset_index(drop=True),
                                 train_df.iloc[val_i].reset_index(drop=True),
-                                best["emb"], best["hid"], best["drop"], best["lr"])
+                                best["emb"], best["hid"], best["drop"], best["lr"],
+                                epochs=best["epochs"])
         folds.append({"fold": fold, **res})
         print(f"  Fold {fold}: acc={res['acc']:.3f}, f1={res['f1']:.3f}")
     cv = pd.DataFrame(folds)
     print(f"BiLSTM: Acc={cv['acc'].mean():.3f}+-{cv['acc'].std():.3f}, F1={cv['f1'].mean():.3f}+-{cv['f1'].std():.3f}")
 
-    # final test
     vocab_fin = build_char_vocab(train_df["text"].tolist())
     tr_dl = DataLoader(CharDataset(train_df, vocab_fin), batch_size=BATCH_SIZE, shuffle=True)
     te_dl = DataLoader(CharDataset(test_df, vocab_fin), batch_size=BATCH_SIZE)
@@ -313,7 +298,7 @@ def run_bilstm(data, train_df, test_df):
     opt = AdamW(m.parameters(), lr=best["lr"])
     crit = nn.CrossEntropyLoss()
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=2)
-    for ep in range(EPOCHS_BI):
+    for ep in range(best["epochs"]):
         m.train()
         el = 0
         for b in tr_dl:
@@ -330,12 +315,8 @@ def run_bilstm(data, train_df, test_df):
             y_pred.extend((torch.softmax(lg, -1)[:, 1] >= THRESH_BI).long().cpu().tolist())
             y_true.extend(b["labels"].tolist())
     print("\n" + classification_report(y_true, y_pred, digits=3))
-    return y_pred, y_true, cv
+    return y_pred, y_true, cv, best
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 4. RuBERT
-# ═══════════════════════════════════════════════════════════════════════════
 
 def _bert_cv(data, max_len, bs, lr, epochs, wd):
     tokenizer = load_tokenizer()
@@ -352,7 +333,8 @@ def _bert_cv(data, max_len, bs, lr, epochs, wd):
         for _ in range(epochs): train_one_epoch(mdl, tr_dl, opt, sched, device)
         metrics, _ = eval_bert(mdl, va_dl, device)
         fold_f1s.append(metrics["f1"])
-        del mdl; torch.cuda.empty_cache()
+        del mdl
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
     return np.mean(fold_f1s), np.std(fold_f1s)
 
 
@@ -368,7 +350,7 @@ def bert_hyperparam_search(data):
         {"max_len": 256, "bs": 16, "lr": 3e-5, "ep": 5, "wd": 0.01},
         {"max_len": 384, "bs": 16, "lr": 3e-5, "ep": 4, "wd": 0.01},
     ]
-    print("=== RuBERT Hyperparam Search ===")
+    print("RuBERT Hyperparam Search")
     best_f1, best_cfg = 0, configs[2]
     for cfg in configs:
         mf, sf = _bert_cv(data, cfg["max_len"], cfg["bs"], cfg["lr"], cfg["ep"], cfg["wd"])
@@ -392,7 +374,7 @@ def bert_shap_analysis(model, tokenizer, test_df, n_samples=5):
         return np.array(res)
     expl = shap.Explainer(pred_fn, masker, output_names=["pop", "sci"])
     sv = expl(test_df["text_clean"].iloc[:n_samples].tolist())
-    print("\n=== SHAP RuBERT ===")
+    print("\nSHAP RuBERT")
     for i in range(n_samples):
         print(f"\nSample {i}: {test_df['text_clean'].iloc[i][:60]}...")
 
@@ -415,11 +397,11 @@ def run_bert(data, train_df, test_df):
         metrics, _ = eval_bert(mdl, va_dl, device)
         folds.append({"fold": fold, **metrics})
         print(f"  Fold {fold}: acc={metrics['acc']:.3f}, f1={metrics['f1']:.3f}")
-        del mdl; torch.cuda.empty_cache()
+        del mdl
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
     cv = pd.DataFrame(folds)
     print(f"RuBERT: Acc={cv['acc'].mean():.3f}+-{cv['acc'].std():.3f}, F1={cv['f1'].mean():.3f}+-{cv['f1'].std():.3f}")
 
-    # final test
     tr_ds = BertDataset(train_df["text_clean"].tolist(), train_df["label"].tolist(), tokenizer, best["max_len"])
     te_ds = BertDataset(test_df["text_clean"].tolist(), test_df["label"].tolist(), tokenizer, best["max_len"])
     tr_dl, te_dl = DataLoader(tr_ds, batch_size=best["bs"], shuffle=True), DataLoader(te_ds, batch_size=best["bs"])
@@ -433,10 +415,80 @@ def run_bert(data, train_df, test_df):
     print("\n" + classification_report(y_true, y_pred, digits=3))
 
     bert_shap_analysis(bert_fin, tokenizer, test_df)
-    return y_pred, y_true, cv
+    del bert_fin
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
+    return y_pred, y_true, cv, best
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+def multi_seed_classifiers(train_df, test_df, best_bi_cfg, best_bert_cfg):
+    SEEDS = [random.randint(0, 2**31 - 1) for _ in range(3)]
+    print("\nMULTI-SEED STABILITY (BiLSTM + RuBERT)")
+
+    bi_seed_results = []
+    print("\nBiLSTM")
+    for s in SEEDS:
+        set_seed(s)
+        vocab = build_char_vocab(train_df["text"].tolist())
+        tr_dl = DataLoader(CharDataset(train_df, vocab), batch_size=BATCH_SIZE, shuffle=True)
+        te_dl = DataLoader(CharDataset(test_df, vocab),  batch_size=BATCH_SIZE)
+        m = CharCNNBiLSTM(len(vocab), best_bi_cfg["emb"], best_bi_cfg["hid"], best_bi_cfg["drop"]).to(device)
+        opt = AdamW(m.parameters(), lr=best_bi_cfg["lr"])
+        crit = nn.CrossEntropyLoss()
+        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=2)
+        for _ in range(best_bi_cfg.get("epochs", EPOCHS_BI)):
+            m.train(); el = 0
+            for b in tr_dl:
+                opt.zero_grad()
+                loss = crit(m(b["input_ids"].to(device), b["lengths"].to(device)), b["labels"].to(device))
+                loss.backward(); opt.step(); el += loss.item()
+            sched.step(el / len(tr_dl))
+        m.eval(); y_pred, y_true = [], []
+        with torch.no_grad():
+            for b in te_dl:
+                lg = m(b["input_ids"].to(device), b["lengths"].to(device))
+                y_pred.extend((torch.softmax(lg, -1)[:, 1] >= THRESH_BI).long().cpu().tolist())
+                y_true.extend(b["labels"].tolist())
+        acc = accuracy_score(y_true, y_pred)
+        prec, rec, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="macro")
+        print(f"  seed={s}: Acc={acc:.4f}, Prec={prec:.4f}, Rec={rec:.4f}, F1={f1:.4f}")
+        bi_seed_results.append({"seed": s, "acc": acc, "prec": prec, "rec": rec, "f1": f1})
+        del m
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+    bert_seed_results = []
+    print("\nRuBERT")
+    tokenizer = load_tokenizer()
+    for s in SEEDS:
+        set_seed(s)
+        tr_ds = BertDataset(train_df["text_clean"].tolist(), train_df["label"].tolist(),
+                             tokenizer, best_bert_cfg["max_len"])
+        te_ds = BertDataset(test_df["text_clean"].tolist(),  test_df["label"].tolist(),
+                             tokenizer, best_bert_cfg["max_len"])
+        tr_dl = DataLoader(tr_ds, batch_size=best_bert_cfg["bs"], shuffle=True)
+        te_dl = DataLoader(te_ds, batch_size=best_bert_cfg["bs"])
+        bert_fin = load_bert(device)
+        opt = AdamW(bert_fin.parameters(), lr=best_bert_cfg["lr"],
+                    weight_decay=best_bert_cfg["wd"])
+        tot = len(tr_dl) * best_bert_cfg["ep"]
+        sch = get_linear_schedule_with_warmup(opt, int(tot * WARMUP_RATIO), tot)
+        for _ in range(best_bert_cfg["ep"]):
+            train_one_epoch(bert_fin, tr_dl, opt, sch, device)
+        metrics, _ = eval_bert(bert_fin, te_dl, device)
+        print(f"  seed={s}: Acc={metrics['acc']:.4f}, Prec={metrics['prec']:.4f}, "
+              f"Rec={metrics['rec']:.4f}, F1={metrics['f1']:.4f}")
+        bert_seed_results.append({"seed": s, **metrics})
+        del bert_fin
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+    print("\nMulti-seed summary (mean ± std по 3 сидам, тестовая выборка)")
+    bi = pd.DataFrame(bi_seed_results)
+    bert = pd.DataFrame(bert_seed_results)
+    print(f"  BiLSTM : Acc={bi['acc'].mean():.4f}+-{bi['acc'].std():.4f}, "
+          f"F1={bi['f1'].mean():.4f}+-{bi['f1'].std():.4f}")
+    print(f"  RuBERT : Acc={bert['acc'].mean():.4f}+-{bert['acc'].std():.4f}, "
+          f"F1={bert['f1'].mean():.4f}+-{bert['f1'].std():.4f}")
+    return bi, bert
+
 
 def main():
     data = load_data()
@@ -444,19 +496,21 @@ def main():
     print(f"train: {len(train_df)}, test: {len(test_df)}")
     assert len(set(train_df["pair_id"]) & set(test_df["pair_id"])) == 0
 
-    print("\n" + "=" * 70 + "\n1. BASELINE\n" + "=" * 70)
+    print("\n1. BASELINE")
     y_bl, bl_cv = run_baseline(data, train_df, test_df)
 
-    print("\n" + "=" * 70 + "\n2. SVM\n" + "=" * 70)
+    print("\n2. SVM")
     y_svm, svm_cv = run_svm(data, train_df, test_df)
 
-    print("\n" + "=" * 70 + "\n3. Char-CNN-BiLSTM\n" + "=" * 70)
-    y_bi, yt_bi, bi_cv = run_bilstm(data, train_df, test_df)
+    print("\n3. Char-CNN-BiLSTM")
+    y_bi, yt_bi, bi_cv, best_bi_cfg = run_bilstm(data, train_df, test_df)
 
-    print("\n" + "=" * 70 + "\n4. RuBERT\n" + "=" * 70)
-    y_bert, yt_bert, bert_cv = run_bert(data, train_df, test_df)
+    print("\n4. RuBERT")
+    y_bert, yt_bert, bert_cv, best_bert_cfg = run_bert(data, train_df, test_df)
 
-    print("\n" + "=" * 70 + "\nITOGI\n" + "=" * 70)
+    multi_seed_classifiers(train_df, test_df, best_bi_cfg, best_bert_cfg)
+
+    print("\nITOGI")
     summary = {
         "Baseline": clf_metrics(test_df["label"].values, y_bl),
         "SVM": clf_metrics(test_df["label"].values, y_svm),
@@ -465,9 +519,10 @@ def main():
     }
     print(pd.DataFrame(summary).T.round(3))
 
-    print("\n=== CV F1 summary ===")
+    print("\nCV F1 summary")
     for name, cv in [("Baseline", bl_cv), ("SVM", svm_cv), ("BiLSTM", bi_cv), ("RuBERT", bert_cv)]:
         print(f"  {name:<15} F1={cv['f1'].mean():.4f}+-{cv['f1'].std():.4f}")
+
 
 if __name__ == "__main__":
     main()

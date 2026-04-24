@@ -1,20 +1,15 @@
-"""
-Валидация корпуса: целостность, баланс, стилевые маркеры,
-парная структура, разбиения.
-"""
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import re
+import random
 import numpy as np
 import pandas as pd
 from scipy import stats
-from collections import Counter
 from sklearn.model_selection import GroupShuffleSplit, GroupKFold
-from sklearn.feature_extraction.text import TfidfVectorizer
 
-from src.preprocessing import load_data, tokenize
-from src.features import style_markers, STOP_RU
+from src.preprocessing import load_data
+from src.features import extract_one, FEAT_NAMES
 
 TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9']+")
 
@@ -23,7 +18,6 @@ def main():
     df = load_data()
     print(f"Строк: {len(df)}, пар: {df['pair_id'].nunique()}")
 
-    # ── целостность ──
     print("\nПропуски:", df.isnull().sum().to_dict())
     empty = df[df["text"].str.len() == 0]
     print(f"Пустых текстов: {len(empty)}")
@@ -37,11 +31,9 @@ def main():
     ]
     print(f"Пар с нарушенной структурой: {len(bad)}")
 
-    # ── баланс ──
     counts = df["label"].value_counts().sort_index()
     print(f"\nБаланс: {counts.to_dict()}")
 
-    # ── длины ──
     df["n_words"] = df["text"].apply(lambda t: len(TOKEN_RE.findall(t)))
     df["n_sents"] = df["text"].apply(
         lambda t: max(len([s for s in re.split(r"(?<=[.!?])\s+", t) if s.strip()]), 1)
@@ -55,24 +47,20 @@ def main():
     U, p = stats.mannwhitneyu(pop["n_words"], sci["n_words"], alternative="two-sided")
     print(f"Mann-Whitney U: U={U:.0f}, p={p:.2e}")
 
-    # ── стилевые маркеры ──
-    markers_df = df["text"].apply(style_markers).apply(pd.Series)
+    feat_matrix = np.vstack([extract_one(t) for t in df["text"].values])
+    markers_df = pd.DataFrame(feat_matrix, columns=FEAT_NAMES, index=df.index)
     df = pd.concat([df, markers_df], axis=1)
 
-    marker_cols = list(markers_df.columns)
     print(f"\n{'Маркер':<20} {'U':>10} {'p-value':>12}")
-    print("-" * 50)
-    for col in marker_cols:
+    for col in FEAT_NAMES:
         v0 = df.loc[df["label"] == 0, col].values
         v1 = df.loc[df["label"] == 1, col].values
         U, p = stats.mannwhitneyu(v0, v1, alternative="two-sided")
         print(f"{col:<20} {U:>10.0f} {p:>12.2e}")
 
-    # ── дубликаты ──
     n_dup = df.duplicated(subset=["text"], keep=False).sum()
     print(f"\nТочных дубликатов: {n_dup}")
 
-    # ── Jaccard ──
     def jaccard(t1, t2):
         w1 = set(TOKEN_RE.findall(str(t1).lower()))
         w2 = set(TOKEN_RE.findall(str(t2).lower()))
@@ -84,8 +72,7 @@ def main():
     print(f"\nJaccard внутри пар: mean={pairs['jaccard'].mean():.3f}, "
           f"median={pairs['jaccard'].median():.3f}")
 
-    # ── проверка разбиений ──
-    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=random.randint(0, 2**31 - 1))
     tr_idx, te_idx = next(gss.split(df["text"], df["label"], groups=df["pair_id"]))
     tr_pairs = set(df.iloc[tr_idx]["pair_id"])
     te_pairs = set(df.iloc[te_idx]["pair_id"])
