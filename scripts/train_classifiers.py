@@ -46,10 +46,10 @@ set_seed()
 device = get_device()
 
 
-def baseline_grid_search(data):
-    X = extract_all(data["text_clean"])
-    y = data["label"].values
-    groups = data["pair_id"].values
+def baseline_grid_search(train_df):
+    X = extract_all(train_df["text_clean"])
+    y = train_df["label"].values
+    groups = train_df["pair_id"].values
 
     pipe = Pipeline([
         ("scaler", StandardScaler()),
@@ -72,30 +72,36 @@ def baseline_grid_search(data):
     return gs.best_estimator_
 
 
-def baseline_ablation(data):
-    X_full = extract_all(data["text_clean"])
-    y = data["label"].values
-    groups = data["pair_id"].values
-
+def baseline_ablation(train_df, test_df):
+    # Для каждого режима абляции: обучаем на ablated train, оцениваем на ablated test.
+    # Тест фиксирован — сравнение корректное.
     def _run(mode):
-        X_ab = extract_all(data["text_clean"])
-        if mode == "no_pron":
-            X_ab[:, 1] = 0
-        elif mode == "no_punct":
-            X_ab[:, 8:11] = 0
-        elif mode == "trunc200":
-            X_ab = extract_all(data["text_clean"].apply(lambda t: " ".join(t.split()[:200])))
+        def _apply(texts):
+            if mode == "no_pron":
+                X = extract_all(texts)
+                X[:, 1] = 0   # обнуляем признак доли местоимений
+                return X
+            elif mode == "no_punct":
+                X = extract_all(texts)
+                X[:, 8:11] = 0  # обнуляем признаки пунктуации
+                return X
+            elif mode == "trunc200":
+                return extract_all(texts.apply(lambda t: " ".join(t.split()[:200])))
+            else:
+                return extract_all(texts)
+
+        X_tr = _apply(train_df["text_clean"])
+        X_te = _apply(test_df["text_clean"])
+        y_tr = train_df["label"].values
+        y_te = test_df["label"].values
+
         pipe = Pipeline([("s", StandardScaler()),
                          ("lr", LogisticRegression(solver="liblinear", max_iter=2000, random_state=SEED))])
-        ms = []
-        for tr, te in GroupKFold(5).split(X_ab, y, groups):
-            pipe.fit(X_ab[tr], y[tr])
-            p = pipe.predict(X_ab[te])
-            ms.append({"acc": accuracy_score(y[te], p),
-                        "f1": f1_score(y[te], p, average="macro")})
-        return pd.DataFrame(ms).mean()
+        pipe.fit(X_tr, y_tr)
+        p = pipe.predict(X_te)
+        return {"acc": accuracy_score(y_te, p), "f1": f1_score(y_te, p, average="macro")}
 
-    print("\nAblation")
+    print("\nAblation (train → test)")
     for label, mode in [("Full", "full"), ("No pronouns", "no_pron"),
                          ("No punctuation", "no_punct"), ("Trunc 200", "trunc200")]:
         r = _run(mode)
@@ -113,35 +119,35 @@ def baseline_coefficients(pipe, X, y):
 
 
 def run_baseline(data, train_df, test_df):
-    best_pipe = baseline_grid_search(data)
-    baseline_ablation(data)
+    best_pipe = baseline_grid_search(train_df)   # ← только train
+    baseline_ablation(train_df, test_df)          # ← train → test
 
-    X = extract_all(data["text_clean"])
-    y = data["label"].values
-    groups = data["pair_id"].values
-    baseline_coefficients(best_pipe, X, y)
+    X_tr = extract_all(train_df["text_clean"])
+    y_tr = train_df["label"].values
+    groups_tr = train_df["pair_id"].values
+    baseline_coefficients(best_pipe, X_tr, y_tr)
 
     gkf = GroupKFold(n_splits=5)
     folds = []
-    for fold, (tr, te) in enumerate(gkf.split(X, y, groups), 1):
-        best_pipe.fit(X[tr], y[tr])
-        pred = best_pipe.predict(X[te])
-        acc = accuracy_score(y[te], pred)
-        p, r, f1, _ = precision_recall_fscore_support(y[te], pred, average="macro")
+    for fold, (tr, te) in enumerate(gkf.split(X_tr, y_tr, groups_tr), 1):  # ← только train
+        best_pipe.fit(X_tr[tr], y_tr[tr])
+        pred = best_pipe.predict(X_tr[te])
+        acc = accuracy_score(y_tr[te], pred)
+        p, r, f1, _ = precision_recall_fscore_support(y_tr[te], pred, average="macro")
         folds.append({"fold": fold, "acc": acc, "prec": p, "rec": r, "f1": f1})
     cv = pd.DataFrame(folds)
-    print("\nBaseline CV")
+    print("\nBaseline CV (только train)")
     print(cv[["fold", "acc", "f1"]].to_string(index=False))
     print(f"Mean: Acc={cv['acc'].mean():.3f}+-{cv['acc'].std():.3f}, F1={cv['f1'].mean():.3f}+-{cv['f1'].std():.3f}")
 
-    X_tr, X_te = extract_all(train_df["text_clean"]), extract_all(test_df["text_clean"])
-    best_pipe.fit(X_tr, train_df["label"].values)
+    X_te = extract_all(test_df["text_clean"])
+    best_pipe.fit(X_tr, y_tr)
     y_pred = best_pipe.predict(X_te)
     print("\n" + classification_report(test_df["label"].values, y_pred, digits=3))
     return y_pred, cv
 
 
-def svm_grid_search(data):
+def svm_grid_search(train_df):
     pipe = Pipeline([
         ("tfidf", TfidfVectorizer(analyzer="char", sublinear_tf=True, norm="l2")),
         ("clf", LinearSVC(max_iter=1000)),
@@ -153,7 +159,7 @@ def svm_grid_search(data):
     }
     gkf = GroupKFold(n_splits=5)
     gs = GridSearchCV(pipe, param_grid, cv=gkf, scoring="f1_macro", refit=True, n_jobs=-1)
-    gs.fit(data["text_clean"], data["label"], groups=data["pair_id"])
+    gs.fit(train_df["text_clean"], train_df["label"], groups=train_df["pair_id"])  # ← только train
 
     print("SVM GridSearch")
     res = pd.DataFrame(gs.cv_results_).sort_values("rank_test_score")
@@ -186,18 +192,18 @@ def svm_shap_analysis(pipe, train_df, test_df):
 
 
 def run_svm(data, train_df, test_df):
-    best_pipe = svm_grid_search(data)
+    best_pipe = svm_grid_search(train_df)   # ← только train
 
     gkf = GroupKFold(n_splits=5)
     folds = []
-    for fold, (tr, te) in enumerate(gkf.split(data["text_clean"], data["label"], groups=data["pair_id"]), 1):
-        best_pipe.fit(data.iloc[tr]["text_clean"], data.iloc[tr]["label"])
-        preds = best_pipe.predict(data.iloc[te]["text_clean"])
-        acc = accuracy_score(data.iloc[te]["label"], preds)
-        p, r, f1, _ = precision_recall_fscore_support(data.iloc[te]["label"], preds, average="macro")
+    for fold, (tr, te) in enumerate(gkf.split(train_df["text_clean"], train_df["label"], groups=train_df["pair_id"]), 1):  # ← только train
+        best_pipe.fit(train_df.iloc[tr]["text_clean"], train_df.iloc[tr]["label"])
+        preds = best_pipe.predict(train_df.iloc[te]["text_clean"])
+        acc = accuracy_score(train_df.iloc[te]["label"], preds)
+        p, r, f1, _ = precision_recall_fscore_support(train_df.iloc[te]["label"], preds, average="macro")
         folds.append({"fold": fold, "acc": acc, "prec": p, "rec": r, "f1": f1})
     cv = pd.DataFrame(folds)
-    print("\nSVM CV")
+    print("\nSVM CV (только train)")
     print(cv[["fold", "acc", "f1"]].to_string(index=False))
     print(f"Mean: F1={cv['f1'].mean():.4f}+-{cv['f1'].std():.4f}")
 
@@ -318,9 +324,11 @@ def run_bilstm(data, train_df, test_df):
     return y_pred, y_true, cv, best
 
 
-def _bert_cv(data, max_len, bs, lr, epochs, wd):
+def _bert_cv(train_df, max_len, bs, lr, epochs, wd):
     tokenizer = load_tokenizer()
-    X_all, y_all, g_all = data["text_clean"].tolist(), data["label"].to_numpy(), data["pair_id"].to_numpy()
+    X_all = train_df["text_clean"].tolist()
+    y_all = train_df["label"].to_numpy()
+    g_all = train_df["pair_id"].to_numpy()   # ← только train
     fold_f1s = []
     for fold, (tr_i, val_i) in enumerate(GroupKFold(5).split(np.zeros(len(y_all)), y_all, g_all), 1):
         tr_ds = BertDataset([X_all[i] for i in tr_i], y_all[tr_i], tokenizer, max_len)
@@ -338,7 +346,7 @@ def _bert_cv(data, max_len, bs, lr, epochs, wd):
     return np.mean(fold_f1s), np.std(fold_f1s)
 
 
-def bert_hyperparam_search(data):
+def bert_hyperparam_search(train_df):
     configs = [
         {"max_len": 128, "bs": 16, "lr": 3e-5, "ep": 4, "wd": 0.01},
         {"max_len": 256, "bs": 16, "lr": 2e-5, "ep": 4, "wd": 0.01},
@@ -353,7 +361,7 @@ def bert_hyperparam_search(data):
     print("RuBERT Hyperparam Search")
     best_f1, best_cfg = 0, configs[2]
     for cfg in configs:
-        mf, sf = _bert_cv(data, cfg["max_len"], cfg["bs"], cfg["lr"], cfg["ep"], cfg["wd"])
+        mf, sf = _bert_cv(train_df, cfg["max_len"], cfg["bs"], cfg["lr"], cfg["ep"], cfg["wd"])  # ← только train
         print(f"  max_len={cfg['max_len']}, bs={cfg['bs']}, lr={cfg['lr']}, ep={cfg['ep']}: F1={mf:.4f}+-{sf:.4f}")
         if mf > best_f1: best_f1, best_cfg = mf, cfg
     print(f"Best: {best_cfg}, F1={best_f1:.4f}")
@@ -380,10 +388,12 @@ def bert_shap_analysis(model, tokenizer, test_df, n_samples=5):
 
 
 def run_bert(data, train_df, test_df):
-    best = bert_hyperparam_search(data)
+    best = bert_hyperparam_search(train_df)   # ← только train
 
     tokenizer = load_tokenizer()
-    X_all, y_all, g_all = data["text_clean"].tolist(), data["label"].to_numpy(), data["pair_id"].to_numpy()
+    X_all = train_df["text_clean"].tolist()
+    y_all = train_df["label"].to_numpy()
+    g_all = train_df["pair_id"].to_numpy()   # ← только train
     folds = []
     for fold, (tr_i, val_i) in enumerate(GroupKFold(5).split(np.zeros(len(y_all)), y_all, g_all), 1):
         tr_ds = BertDataset([X_all[i] for i in tr_i], y_all[tr_i], tokenizer, best["max_len"])
@@ -425,7 +435,7 @@ def multi_seed_classifiers(train_df, test_df, best_bi_cfg, best_bert_cfg):
     print("\nMULTI-SEED STABILITY (BiLSTM + RuBERT)")
 
     bi_seed_results = []
-    print("\nBiLSTM")
+    print("\n--- BiLSTM ---")
     for s in SEEDS:
         set_seed(s)
         vocab = build_char_vocab(train_df["text"].tolist())
@@ -456,7 +466,7 @@ def multi_seed_classifiers(train_df, test_df, best_bi_cfg, best_bert_cfg):
         if torch.cuda.is_available(): torch.cuda.empty_cache()
 
     bert_seed_results = []
-    print("\nRuBERT")
+    print("\n--- RuBERT ---")
     tokenizer = load_tokenizer()
     for s in SEEDS:
         set_seed(s)
